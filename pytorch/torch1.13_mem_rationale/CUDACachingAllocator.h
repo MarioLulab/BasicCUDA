@@ -8,6 +8,9 @@
 #define THC_DEVICE_ALLOCATOR_INC
 
 #include <cuda_runtime_api.h>
+#define EXPANDABLE_SEGMENTS_SUPPORTED
+#include <cuda.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -22,6 +25,7 @@
 #include <regex>
 #include <set>
 #include <vector>
+#include <optional>
 
 using namespace std;
 // original code: using stream_set = ska::flat_hash_set<cuda::CUDAStream>;
@@ -61,6 +65,20 @@ template <typename... Args> std::string concatenate(Args... args)
             fprintf(stderr, "CUDA ERROR: (error code %s)!\n", cudaGetErrorString(__err)); \
             exit(EXIT_FAILURE);                                                           \
         }                                                                                 \
+    } while (0)
+
+#define C10_CUDA_DRIVER_CHECK(EXPR)                                        \
+    do {                                                                     \
+        CUresult __err = EXPR;                                                 \
+        if (__err != CUDA_SUCCESS) {                                           \
+            const char* err_str;                                                 \
+            CUresult get_error_str_err C10_UNUSED = cuGetErrorString(__err, &err_str); \
+            if (get_error_str_err != CUDA_SUCCESS) {                             \
+                printf("CUDA driver error: unknown error\n");                      \
+            } else {                                                             \
+                printf("CUDA driver error: %s\n", err_str);                          \
+            }                                                                    \
+        }                                                                      \
     } while (0)
 
 // Simplified torch_check：
@@ -176,24 +194,31 @@ struct SegmentInfo {
     int64_t active_size = 0;
     cudaStream_t stream = 0;
     bool is_large = false;
+    bool is_expandable = false;
     std::vector<BlockInfo> blocks;
 };
 
 struct Block;
 struct PrivatePool; // CUDA graphs helper
 typedef bool (*Comparison)(const Block *, const Block *);
+static bool BlockComparatorSize(const Block* a, const Block* b);
+static bool BlockComparatorAddress(const Block* a, const Block* b);
 
 struct BlockPool {
-    BlockPool(Comparison comparator, bool small, PrivatePool *private_pool = nullptr)
-        : blocks(comparator)
+    BlockPool(bool small, PrivatePool *private_pool = nullptr)
+        : blocks(BlockComparatorSize)
+        , unmapped(BlockComparatorAddress)
         , is_small(small)
         , owner_PrivatePool(private_pool)
     {
     }
     std::set<Block *, Comparison> blocks;
+    std::set<Block*, Comparison> unmapped;
     const bool is_small;
     PrivatePool *owner_PrivatePool;
 };
+
+struct ExpandableSegment;
 
 struct Block {
     int device;             // gpu
@@ -203,6 +228,11 @@ struct Block {
     BlockPool *pool;        // owning memory pool
     void *ptr;              // memory address
     bool allocated;         // in-use flag
+    bool mapped{true};      // is the virtual address range this Block references
+                            // backed by physical pages. Always true when
+                            // expandable_segment_ is null. When false
+                            // This Block will be aligned to the segment size
+                            // of its expandable_segment_.
     Block *prev;            // prev block if split from a larger allocation
     Block *next;            // next block if split from a larger allocation
     int event_count;        // number of outstanding CUDA events
@@ -210,6 +240,7 @@ struct Block {
                             // garbage collection
     std::unique_ptr<History> history;
     History *history_last;
+    ExpandableSegment* expandable_segment_{nullptr};
 
     Block(int device, cudaStream_t stream, size_t size, BlockPool *pool, void *ptr)
         : device(device)
@@ -246,7 +277,240 @@ struct Block {
     {
         return (prev != nullptr) || (next != nullptr);
     }
+
+    void splice(Block* before, Block* after) 
+    {
+        if (before) {
+            TORCH_INTERNAL_ASSERT(before->next == after);
+            before->next = this;
+        }
+        prev = before;
+        if (after) {
+            TORCH_INTERNAL_ASSERT(after->prev == before);
+            after->prev = this;
+        }
+        next = after;
+    }
+
 };
+
+struct SegmentRange {
+    char* ptr;
+    size_t size;
+    SegmentRange(void* p, size_t s) : ptr(static_cast<char*>(p)), size(s) {}
+};
+
+#ifdef EXPANDABLE_SEGMENTS_SUPPORTED
+struct ExpandableSegment {
+  ExpandableSegment(
+      int device,
+      cudaStream_t stream,
+      size_t size,
+      const std::vector<int>& peers)
+      : device_(device),
+        stream_(stream),
+        max_handles_(0),
+        // 2MB for small pool, 20MB for large pool
+        segment_size_(size),
+        peers_(peers) {
+        cudaDeviceProp prop;
+        C10_CUDA_CHECK(cudaGetDeviceProperties(&prop, device_));
+        // we allocate enough address space for 1 1/8 the total memory on the GPU.
+        // This allows for some cases where we have to unmap pages earlier in the
+        // segment to put them at the end.
+        max_handles_ = numSegments(prop.totalGlobalMem + prop.totalGlobalMem / 8);
+        C10_CUDA_DRIVER_CHECK(cuMemAddressReserve(
+        &ptr_, segment_size_ * max_handles_, 0ULL, 0, 0ULL));
+    }
+
+    // begin must be aligned to segment_size_.
+    // returns the actual range mapped, which may be
+    // greater than requested if size is not aligned to segment_size_.
+    // return size of 0 indicates OOM
+    SegmentRange map(SegmentRange range) {
+        auto begin = segmentLeft(range.ptr);
+        auto end = segmentRight(range.ptr + range.size);
+        TORCH_INTERNAL_ASSERT(ptr() + begin * segment_size_ == range.ptr);
+        if (begin == end) 
+        {
+            return rangeFromHandles(begin, end);
+        }
+        while (end > handles_.size()) 
+        {
+            handles_.push_back(std::nullopt);
+        }
+        // original style: for (int i = begin; i < end; ++i) 
+        for (int i = begin; i < end; ++i)
+        {
+            TORCH_INTERNAL_ASSERT(!handles_.at(i));
+            CUmemGenericAllocationHandle handle;
+            CUmemAllocationProp prop = {};
+            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+            prop.location.id = device_;
+            auto status = cuMemCreate(&handle, segment_size_, &prop, 0);
+            if (status == CUDA_ERROR_OUT_OF_MEMORY) {
+                // original style: for (auto j : c10::irange(begin, i))
+                for (int j = begin; j < i; ++j)
+                {
+                    auto handle = handles_.at(j).value();
+                    handles_.at(j) = std::nullopt;
+                    C10_CUDA_DRIVER_CHECK(cuMemRelease(handle));
+                }
+                trimHandles();
+                return rangeFromHandles(begin, begin);
+            }
+            C10_CUDA_DRIVER_CHECK(status);
+            handles_.at(i) = handle;
+        }
+        // original style: for (int i = begin; i < end; ++i)
+        for (int i = begin; i < end; ++i)
+        {
+            C10_CUDA_DRIVER_CHECK(cuMemMap(
+                ptr_ + i * segment_size_,
+                segment_size_,
+                0,
+                handles_.at(i).value(),
+                0ULL));
+        }
+
+        setAccess(device_, begin, end);
+        for (auto p : peers_) {
+        setAccess(p, begin, end);
+        }
+        return rangeFromHandles(begin, end);
+    }
+
+  // unmaps all the completely empty segment_size_ segments between
+  // [begin, begin + size), returns the offset where the range begin,
+  // and the actual size unmapped (multiple of segment_size_)
+  SegmentRange unmap(SegmentRange range) {
+    auto begin = segmentRight(range.ptr);
+    auto end = segmentLeft(range.ptr + range.size);
+    if (begin >= end) {
+      return SegmentRange{range.ptr, 0};
+    }
+    unmapHandles(begin, end);
+    return rangeFromHandles(begin, end);
+  }
+
+  char* ptr() const {
+    return (char*)ptr_;
+  }
+  size_t size() const {
+    return max_handles_ * segment_size_;
+  }
+
+  void addPeer(int device) {
+    peers_.push_back(device);
+    forEachAllocatedRange(
+        [&](size_t begin, size_t end) { setAccess(device, begin, end); });
+  }
+
+  ~ExpandableSegment() {
+    forEachAllocatedRange(
+        [&](size_t begin, size_t end) { unmapHandles(begin, end); });
+    C10_CUDA_DRIVER_CHECK(cuMemAddressFree(
+        ptr_, segment_size_ * max_handles_));
+  }
+
+ private:
+  void setAccess(int device, size_t begin, size_t end) {
+    CUmemAccessDesc desc;
+    desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    desc.location.id = device;
+    desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    C10_CUDA_DRIVER_CHECK(cuMemSetAccess(
+        ptr_ + begin * segment_size_, (end - begin) * segment_size_, &desc, 1));
+  }
+
+  void unmapHandles(size_t begin, size_t end) {
+    // note: unlike cudaFree, MemUnmap and MemRelease do
+    // not appear to synchronize in all cases, so we have to wait for the
+    // stream to finish before this memory is truly free.
+
+    // cannot call c10::cuda::stream_synchronize because
+    // it might grab the GIL which can lead to a deadlock
+    // Locking order must be GIL -> Allocator Lock
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    for (int i = begin; i < end; ++i) {
+      CUmemGenericAllocationHandle h = handles_.at(i).value();
+      handles_.at(i) = std::nullopt;
+      C10_CUDA_DRIVER_CHECK(cuMemUnmap(
+          ptr_ + segment_size_ * i, segment_size_));
+      C10_CUDA_DRIVER_CHECK(cuMemRelease(h));
+    }
+    trimHandles();
+  }
+  void trimHandles() {
+    while (!handles_.empty() && !handles_.back()) {
+      handles_.pop_back();
+    }
+  }
+  void forEachAllocatedRange(std::function<void(size_t, size_t)> fn) {
+    auto start = 0;
+    // for (auto i : c10::irange(handles_.size())) 
+    for (int i = 0; i < handles_.size(); ++i)
+    {
+      if (handles_.at(i) && (i == 0 || !handles_.at(i - 1))) {
+        start = i;
+      }
+      if (handles_.at(i) && (i + 1 == handles_.size() || !handles_.at(i + 1))) {
+        fn(start, i + 1);
+      }
+    }
+  }
+  size_t numSegments(size_t size) {
+    return (size + segment_size_ - 1) / segment_size_;
+  }
+  size_t segmentLeft(char* p) {
+    auto size = p - ptr();
+    return size / segment_size_;
+  }
+  size_t segmentRight(char* p) {
+    auto size = p - ptr();
+    return numSegments(size);
+  }
+  SegmentRange rangeFromHandles(size_t begin, size_t end) {
+    return SegmentRange(
+        ptr() + segment_size_ * begin, segment_size_ * (end - begin));
+  }
+
+  int device_;
+  cudaStream_t stream_;
+  CUdeviceptr ptr_;
+  size_t max_handles_;
+  size_t segment_size_;
+  std::vector<std::optional<CUmemGenericAllocationHandle>> handles_;
+  // devices on which this memory should be mapped in addition
+  // to the device where the physical memory lives (device_).
+  std::vector<int> peers_;
+
+};
+#else
+struct ExpandableSegment {
+  ExpandableSegment(
+      int device,
+      cudaStream_t stream,
+      size_t size,
+      const std::vector<int>& peers) {
+    TORCH_INTERNAL_ASSERT(false, "expandable segment not supported");
+  }
+  SegmentRange map(SegmentRange range) {
+    return SegmentRange(nullptr, 0);
+  }
+  SegmentRange unmap(SegmentRange range) {
+    return SegmentRange(nullptr, 0);
+  }
+  char* ptr() const {
+    return nullptr;
+  }
+  size_t size() const {
+    return 0;
+  }
+  void addPeer(int device) {}
+};
+#endif  // EXPANDABLE_SEGMENTS_SUPPORTED
 
 static bool BlockComparator(const Block *a, const Block *b)
 {
@@ -255,6 +519,25 @@ static bool BlockComparator(const Block *a, const Block *b)
     }
     if (a->size != b->size) {
         return a->size < b->size;
+    }
+    return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
+}
+
+static bool BlockComparatorSize(const Block* a, const Block* b)
+{
+    if (a->stream != b->stream) {
+        return (uintptr_t)a->stream < (uintptr_t)b->stream;
+    }
+    if (a->size != b->size) {
+        return a->size < b->size;
+    }
+    return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
+}
+
+static bool BlockComparatorAddress(const Block* a, const Block* b)
+{
+    if (a->stream != b->stream) {
+        return (uintptr_t)a->stream < (uintptr_t)b->stream;
     }
     return (uintptr_t)a->ptr < (uintptr_t)b->ptr;
 }

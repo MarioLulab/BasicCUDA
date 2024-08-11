@@ -95,6 +95,11 @@ public:
         return instance().m_roundup_bypass_threshold;
     }
 
+    static bool expandable_segments()
+    {
+        return instance().m_expandable_segments;
+    }
+
     static CachingAllocatorConfig &instance()
     {
         static CachingAllocatorConfig *s_instance = ([]() {
@@ -160,7 +165,11 @@ public:
                     TORCH_CHECK(val2 > 0, "garbage_collect_threshold too small, set it 0.0~1.0", "");
                     TORCH_CHECK(val2 < 1.0, "garbage_collect_threshold too big, set it 0.0~1.0", "");
                     m_garbage_collection_threshold = val2;
-                } else {
+                } 
+                else if (kv[0].compare("expandable_segments") == 0) {                    
+                    m_expandable_segments = (kv[1] == "True");
+                }
+                else {
                     TORCH_CHECK(false, "Unrecognized CachingAllocator option: ", kv[0]);
                 }
             }
@@ -172,12 +181,14 @@ private:
         : m_max_split_size(std::numeric_limits<size_t>::max())
         , m_roundup_power2_divisions(0)
         , m_garbage_collection_threshold(0)
+        , m_expandable_segments(false)
     {
     }
     std::atomic<size_t> m_max_split_size;
     std::atomic<size_t> m_roundup_power2_divisions;
     std::atomic<size_t> m_roundup_bypass_threshold;
     std::atomic<double> m_garbage_collection_threshold;
+    std::atomic<bool> m_expandable_segments;
 };
 
 class DeviceCachingAllocator {
@@ -210,12 +221,16 @@ public:
 
     size_t allowed_memory_maximum = 0;
 
+    // all live expandable segments
+    std::vector<ExpandableSegment*> expandable_segments_;
+    std::vector<int> devices_with_peer_access_;
+    
     bool set_fraction = false;
 
 public:
     DeviceCachingAllocator()
-        : large_blocks(BlockComparator, /*is_small=*/false)
-        , small_blocks(BlockComparator, /*is_small=*/true)
+        : large_blocks(/*is_small=*/false)
+        , small_blocks(/*is_small=*/true)
     {
         stats.max_split_size = CachingAllocatorConfig::max_split_size();
     }
@@ -308,9 +323,12 @@ public:
         }
     }
 
-    StatType get_stat_type_for_pool(const BlockPool &pool)
-    {
-        return pool.is_small ? StatType::SMALL_POOL : StatType::LARGE_POOL;
+    StatTypes get_stat_types_for_pool(const BlockPool& pool) {
+        StatTypes stat_types = {false};
+        stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
+        stat_types[static_cast<size_t>(
+            pool.is_small ? StatType::SMALL_POOL : StatType::LARGE_POOL)] = true;
+        return stat_types;
     }
 
     // search block in pools -> found best block if it has  -> create a new block if it hasn't.
@@ -324,8 +342,7 @@ public:
         const size_t alloc_size = get_allocation_size(size); // alloc size suggestion。
         AllocParams params(device, size, stream, &pool, alloc_size, stats);
         // change stat_types
-        params.stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
-        params.stat_types[static_cast<size_t>(get_stat_type_for_pool(pool))] = true;
+        params.stat_types = get_stat_types_for_pool(pool);
 
         // First, try to get a block from the existing pool.
         bool block_found =
@@ -403,6 +420,7 @@ public:
             remaining = block;
 
             block = new Block(device, stream, size, &pool, block->ptr);
+            block->expandable_segment_ = remaining->expandable_segment_;
             block->prev = remaining->prev;
             if (block->prev) {
                 block->prev->next = block;
@@ -419,10 +437,10 @@ public:
             //   trimHistoryBefore(remaining, (char*)block->ptr + size);
             // }
 
-            if (already_split) {
+            if (already_split && !block->expandable_segment_) {
                 // An already-split inactive block is being shrunk by size bytes.
                 update_stat_array(stats.inactive_split_bytes, -block->size, params.stat_types);
-            } else {
+            } else if (!block->expandable_segment_){
                 // A new split inactive block is being created from a previously unsplit
                 // block, size remaining->size bytes.
                 for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
@@ -431,7 +449,7 @@ public:
                 });
             }
 
-        } else if (already_split) {
+        } else if (already_split && !block->expandable_segment_) {
             // An already-split block is becoming active
             for_each_selected_stat_type(params.stat_types, [&](size_t stat_type) {
                 update_stat(stats.inactive_split_bytes[stat_type], -block->size);
@@ -486,9 +504,7 @@ public:
         auto orig_block_ptr = block->ptr;
         auto orig_block_size = block->size;
 
-        StatTypes stat_types = {false};
-        stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
-        stat_types[static_cast<size_t>(get_stat_type_for_pool(*(block->pool)))] = true;
+        StatTypes stat_types = get_stat_types_for_pool(*block->pool);
         for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
             update_stat(stats.allocation[stat_type], -1);
             update_stat(stats.allocated_bytes[stat_type], -block->size);
@@ -517,6 +533,137 @@ public:
         //     stats.allocated_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         //     stats.reserved_bytes[static_cast<size_t>(StatType::AGGREGATE)].current,
         //     c10::Device(c10::DeviceType::CUDA, block->device));
+    }
+
+
+    // returns the smallest possible address in any segment
+    // where there is enough free address space to fit size
+    // may be composed of free and unmapped segments
+    Block* find_expandable_block(
+        int device,
+        cudaStream_t stream,
+        BlockPool* pool,
+        size_t size) {
+        Block key(device, stream, 0);
+
+        auto allocatable = [](Block* b) {
+        return b && !b->allocated && b->event_count == 0 &&
+            b->stream_uses.empty();
+        };
+        auto has_available_address_space = [&](Block* b) {
+        size_t bytes = 0;
+        while (bytes < size && allocatable(b)) {
+            bytes += b->size;
+            b = b->next;
+        }
+        return bytes >= size;
+        };
+        for (auto it = pool->unmapped.lower_bound(&key);
+            it != pool->unmapped.end() && (*it)->stream == stream;
+            ++it) {
+        Block* c = *it;
+        // we found the lowest address of an unmapped segment
+        // but there might be a free segment we can also use
+        // right before it
+        if (allocatable(c->prev)) {
+            c = c->prev;
+        }
+        if (has_available_address_space(c)) {
+            return c;
+        }
+        }
+        auto segment_size = pool->is_small ? kSmallBuffer : kLargeBuffer;
+        expandable_segments_.emplace_back(new ExpandableSegment(
+            device, stream, segment_size, devices_with_peer_access_));
+
+        ExpandableSegment* es = expandable_segments_.back();
+        Block* candidate = new Block(device, stream, es->size(), pool, es->ptr());
+        candidate->mapped = false;
+        candidate->expandable_segment_ = es;
+        pool->unmapped.insert(candidate);
+        return candidate;
+    }
+
+    bool map_block(
+        Block* to_map,
+        size_t size) {
+        TORCH_INTERNAL_ASSERT(!to_map->mapped && size <= to_map->size);
+        TORCH_INTERNAL_ASSERT(
+            !to_map->history); // unmapped blocks should not keep history
+        auto mapped_range =
+            to_map->expandable_segment_->map(SegmentRange{to_map->ptr, size});
+        // failed to map the memory
+        if (mapped_range.size == 0) {
+        return false;
+        }
+        TORCH_INTERNAL_ASSERT(
+            mapped_range.ptr == to_map->ptr && mapped_range.size >= size);
+
+        BlockPool& pool = *to_map->pool;
+        pool.unmapped.erase(to_map);
+        to_map->mapped = true;
+
+        if (mapped_range.size < to_map->size) {
+        // to_map -> remaining -> to_map->next(?)
+        Block* remaining = new Block(
+            to_map->device,
+            to_map->stream,
+            to_map->size - mapped_range.size,
+            &pool,
+            static_cast<char*>(to_map->ptr) + mapped_range.size);
+        remaining->mapped = false;
+        remaining->expandable_segment_ = to_map->expandable_segment_;
+        remaining->splice(to_map, to_map->next);
+        pool.unmapped.insert(remaining);
+        to_map->size = mapped_range.size;
+        }
+
+        try_merge_blocks(to_map, to_map->prev, pool);
+        try_merge_blocks(to_map, to_map->next, pool);
+
+        pool.blocks.insert(to_map);
+
+        // update statistics
+        total_allocated_memory += mapped_range.size;
+        StatTypes stat_types = get_stat_types_for_pool(*to_map->pool);
+        for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+        update_stat(stats.reserved_bytes[stat_type], mapped_range.size);
+        });
+
+        return true;
+    }
+
+    Block* try_allocate_expandable_block(
+        int device,
+        cudaStream_t stream,
+        BlockPool* pool,
+        size_t size,
+        const std::shared_ptr<GatheredContext>& ctx) {
+        Block* candidate = find_expandable_block(device, stream, pool, size);
+        // Candidate is now a list free/unmapped blocks with at least size room:
+        // unmapped -> null
+        // unmapped -> free -> *
+        // free -> unmapped -> *
+
+        if (!candidate->mapped &&
+            !map_block(candidate, std::min(candidate->size, size), ctx)) {
+        return nullptr;
+        }
+        TORCH_INTERNAL_ASSERT(candidate->mapped);
+
+        while (candidate->size < size) {
+        // invariant: free -> unmapped -> *
+        // map_block will map some of unmapped and merge with free
+        auto remaining = size - candidate->size;
+        auto new_candidate = candidate->next;
+        if (!map_block(
+                new_candidate, std::min(remaining, candidate->next->size), ctx)) {
+            return nullptr;
+        }
+        candidate = new_candidate;
+        }
+        pool->blocks.erase(candidate);
+        return candidate;
     }
 
     void free_block(Block *block)
@@ -549,12 +696,21 @@ public:
             net_change_inactive_split_size += block->size;
         }
 
-        StatTypes stat_types = {false};
-        stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
-        stat_types[static_cast<size_t>(get_stat_type_for_pool(pool))] = true;
+        StatTypes stat_types = get_stat_types_for_pool(pool);
         for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
-            update_stat(stats.inactive_split[stat_type], net_change_inactive_split_blocks);
-            update_stat(stats.inactive_split_bytes[stat_type], net_change_inactive_split_size);
+            // inactive_split tries to capture the idea that blocks
+            // cannot be freed when requested, but fully free pages
+            // of expandable blocks can always be freed.
+            // The logic to track this as statistic is pretty involved,
+            // so we simply just exclude expandable segements from
+            // inactive_split            
+            if (!block->expandable_segment_) {
+                update_stat(
+                    stats.inactive_split[stat_type], net_change_inactive_split_blocks);
+                update_stat(
+                    stats.inactive_split_bytes[stat_type],
+                    net_change_inactive_split_size);
+            }            
             update_stat(stats.active[stat_type], -1);
             update_stat(stats.active_bytes[stat_type], -original_block_size);
         });
@@ -564,7 +720,7 @@ public:
      * or 0 on failure. */
     size_t try_merge_blocks(Block *dst, Block *src, BlockPool &pool)
     {
-        if (!src || src->allocated || src->event_count > 0 || !src->stream_uses.empty()) {
+        if (!src || src->allocated || src->event_count > 0 || !src->stream_uses.empty() || dst->mapped != src->mapped) {
             return 0;
         }
 
@@ -601,7 +757,7 @@ public:
         }
         const size_t subsumed_size = src->size;
         dst->size += subsumed_size;
-        auto erased = pool.blocks.erase(src);
+        auto erased =  src->mapped ? pool.blocks.erase(src) : pool.unmapped.erase(src);
         // TORCH_INTERNAL_ASSERT_DEBUG_ONLY(erased == 1);
         delete src;
 
@@ -615,6 +771,41 @@ public:
         auto it = pool.blocks.lower_bound(&p.search_key); // set-container search, return minium satisfied value.
         if (it == pool.blocks.end() || (*it)->stream != p.stream())
             return false;
+
+
+        if ((*it)->expandable_segment_) {
+            if (CachingAllocatorConfig::expandable_segments()) {
+                // if we are allocated to the part of the block that is expandable
+                // for the purposes of "best fit" we consider its size to be the size it
+                // can expand to, not the size it currently is. This means that we
+                // sometimes have to search for blocks with bigger 'size' before
+                // choosing this segment.
+                auto expandable_size = [](Block* b) {
+                return b->size + (b->next && !b->next->mapped ? b->next->size : 0);
+                };
+                auto next = it;
+                next++;
+                while ((*it)->expandable_segment_ && next != pool.blocks.end() &&
+                    (*next)->stream == p.stream() &&
+                    expandable_size(*next) < expandable_size(*it)) {
+                it = next++;
+                }
+            } else {
+                // Rarely expandable segments has been turned off after we have
+                // already allocated some blocks as expandable. For instance,
+                // since we cannot share expandable memory via IPC, someone might
+                // temporarily disable it. In this case we need to honor this request
+                // by only finding non-expandable blocks
+                do {
+                it++;
+                } while (it != pool.blocks.end() && (*it)->expandable_segment_ &&
+                        (*it)->stream == p.stream());
+                if (it == pool.blocks.end() || (*it)->stream != p.stream()) {
+                return false;
+                }
+            }
+        }
+
 
         // Do not return an oversized block for a large request
         if ((p.size() < CachingAllocatorConfig::max_split_size()) &&
@@ -711,7 +902,21 @@ public:
         if (set_fraction && total_allocated_memory + size > allowed_memory_maximum) {
             p.err = cudaErrorMemoryAllocation;
             return false;
-        } else {
+        } else if (
+            CachingAllocatorConfig::expandable_segments() &&
+            // our checkpointing logic for private pools doesn't support
+            // the expandable_segments_ structure yet
+            !p.pool->owner_PrivatePool) {
+                p.block = try_allocate_expandable_block(
+                    p.device(), p.stream(), p.pool, p.size(), ctx);
+                if (p.block) {
+                    p.err = cudaSuccess;
+                } else {
+                    p.err = cudaErrorMemoryAllocation;
+                }
+                return bool(p.block);
+        }
+        else {
             // origin： p.err = cudaMallocMaybeCapturing(&ptr, size);
             p.err = cudaMalloc(&ptr, size);
             if (p.err != cudaSuccess) {
@@ -757,7 +962,7 @@ public:
     bool should_split(const Block *block, size_t size)
     {
         size_t remaining = block->size - size;
-        if (block->pool->is_small) {
+        if (block->pool->is_small || CachingAllocatorConfig::expandable_segments()) {
             return remaining >= kMinBlockSize;
         } else {
             return (size < CachingAllocatorConfig::max_split_size()) && (remaining > kSmallSize);
@@ -835,12 +1040,30 @@ public:
         return true;
     }
 
+
+    void release_expandable_segment(Block* block) {
+        TORCH_INTERNAL_ASSERT(
+            block->size == block->expandable_segment_->size(),
+            "block disagrees with segment");
+        TORCH_INTERNAL_ASSERT(!block->mapped);
+        auto it = std::find(
+            expandable_segments_.begin(),
+            expandable_segments_.end(),
+            block->expandable_segment_);
+        TORCH_INTERNAL_ASSERT(it != expandable_segments_.end());
+        expandable_segments_.erase(it);
+        block->pool->unmapped.erase(block);
+        delete block->expandable_segment_;
+        delete block;
+    }
+
     /*
      * Do not invoke release_block() without if(!block->prev && !block->next).
      * It will raise a segment error, if release parts of segment.
      */
     void release_block(Block *block)
     {
+        TORCH_INTERNAL_ASSERT(!block->expandable_segment_);
         C10_CUDA_CHECK(cudaFree((void *)block->ptr));
         total_allocated_memory -= block->size;
         auto *pool = block->pool;
@@ -851,9 +1074,7 @@ public:
         //   pool->owner_PrivatePool->cudaMalloc_count--;
         // }
 
-        StatTypes stat_types = {false};
-        stat_types[static_cast<size_t>(StatType::AGGREGATE)] = true;
-        stat_types[static_cast<size_t>(get_stat_type_for_pool(*pool))] = true;
+        auto stat_types = get_stat_types_for_pool(*pool);
         for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
             update_stat(stats.segment[stat_type], -1);
             update_stat(stats.reserved_bytes[stat_type], -block->size);
@@ -864,16 +1085,88 @@ public:
         pool->blocks.erase(block);
         delete block;
     }
+    void unmap_block(Block* block) {
+        auto unmapped = block->expandable_segment_->unmap(
+            SegmentRange{block->ptr, block->size});
+        if (unmapped.size == 0) {
+        return;
+        }
+        block->pool->blocks.erase(block);
+
+        ptrdiff_t before_size =
+            static_cast<char*>(unmapped.ptr) - static_cast<char*>(block->ptr);
+        if (before_size > 0) {
+        // prev? -> before_free -> block
+        Block* before_free = new Block(
+            block->device, block->stream, before_size, block->pool, block->ptr);
+        before_free->expandable_segment_ = block->expandable_segment_;
+        before_free->splice(block->prev, block);
+        block->pool->blocks.insert(before_free);
+        }
+
+        auto after_size = block->size - (before_size + unmapped.size);
+        if (after_size > 0) {
+        // block -> after_free -> next?
+        Block* after_free = new Block(
+            block->device,
+            block->stream,
+            after_size,
+            block->pool,
+            static_cast<char*>(unmapped.ptr) + unmapped.size);
+        after_free->expandable_segment_ = block->expandable_segment_;
+        after_free->splice(block, block->next);
+        block->pool->blocks.insert(after_free);
+        }
+
+        block->ptr = unmapped.ptr;
+        block->size = unmapped.size;
+        block->mapped = false;
+        block->history.reset();
+        block->history_last = nullptr;
+
+        try_merge_blocks(block, block->prev, *block->pool);
+        try_merge_blocks(block, block->next, *block->pool);
+        block->pool->unmapped.insert(block);
+
+        // update statistics
+        total_allocated_memory -= unmapped.size;
+        StatTypes stat_types = get_stat_types_for_pool(*block->pool);
+        for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
+        update_stat(stats.reserved_bytes[stat_type], -unmapped.size);
+        });
+        if (record_history) {
+        record_trace(
+            TraceEntry::SEGMENT_UNMAP,
+            int64_t(unmapped.ptr),
+            unmapped.size,
+            block->stream,
+            block->history ? block->history->h.context : nullptr);
+        }
+    }
+
 
     void release_blocks(BlockPool &pool)
     {
+        std::vector<Block*> to_unmap;
         // Frees all non-split blocks
         auto it = pool.blocks.begin();
         while (it != pool.blocks.end()) {
             Block *block = *it;
             ++it;
-            if (!block->prev && !block->next) {
+            if (block->expandable_segment_) {
+                // unmapping will mutate the free pool
+                // so just gather what needs to be freed
+                // to avoid invalidating the iterator
+                to_unmap.push_back(block);
+            } else if (!block->prev && !block->next) {
                 release_block(block);
+            }
+        }
+
+        for (Block* block : to_unmap) {
+            unmap_block(block);
+            if (!block->prev && !block->next) {
+                release_expandable_segment(block);
             }
         }
     }
@@ -884,6 +1177,24 @@ public:
         std::lock_guard<std::recursive_mutex> lock(mutex);
         release_cached_blocks();
     }
+
+  void addPeerAccess(int dev_to_access) {
+    if (std::find(
+            devices_with_peer_access_.begin(),
+            devices_with_peer_access_.end(),
+            dev_to_access) != devices_with_peer_access_.end()) {
+      return;
+    }
+    devices_with_peer_access_.push_back(dev_to_access);
+    for (auto& es : expandable_segments_) {
+      es->addPeer(dev_to_access);
+    }
+  }
+
+  bool hasAllocatedExpandableSegments() const {
+    return !expandable_segments_.empty();
+  }
+
 };
 
 void auxPrintPtrInfo(void *ptr)
