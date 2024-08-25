@@ -767,6 +767,14 @@ public:
     bool get_free_block(AllocParams &p)
     {
         BlockPool &pool = *p.pool;
+        if (C10_UNLIKELY(
+                set_fraction &&
+                CachingAllocatorConfig::garbage_collection_threshold() > 0.0)) {
+            // Track block reuse interval only when garbage collection is enabled.
+            for (auto& b : pool.blocks) {
+                ++b->gc_count;
+            }
+        }
 
         auto it = pool.blocks.lower_bound(&p.search_key); // set-container search, return minium satisfied value.
         if (it == pool.blocks.end() || (*it)->stream != p.stream())
