@@ -8,6 +8,7 @@
 #define THC_DEVICE_ALLOCATOR_INC
 
 #include <cuda_runtime_api.h>
+// #define EXPANDABLE_SEGMENTS_SUPPORTED 1
 #ifdef EXPANDABLE_SEGMENTS_SUPPORTED
 #include <cuda.h>
 #endif

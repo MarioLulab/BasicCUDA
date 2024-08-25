@@ -281,7 +281,7 @@ public:
 
     BlockPool &get_pool(size_t size, cudaStream_t stream)
     {
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 11000
+#if false && defined(CUDA_VERSION) && CUDA_VERSION >= 11000
         // captures_underway is a conservative guess that the current stream may be
         // capturing. It's only > 0 if some thread has begun and not yet ended a
         // capture, so it's usually 0, and we can short-circuit
@@ -551,26 +551,26 @@ public:
             b->stream_uses.empty();
         };
         auto has_available_address_space = [&](Block* b) {
-        size_t bytes = 0;
-        while (bytes < size && allocatable(b)) {
-            bytes += b->size;
-            b = b->next;
-        }
-        return bytes >= size;
+            size_t bytes = 0;
+            while (bytes < size && allocatable(b)) {
+                bytes += b->size;
+                b = b->next;
+            }
+            return bytes >= size;
         };
         for (auto it = pool->unmapped.lower_bound(&key);
             it != pool->unmapped.end() && (*it)->stream == stream;
             ++it) {
-        Block* c = *it;
-        // we found the lowest address of an unmapped segment
-        // but there might be a free segment we can also use
-        // right before it
-        if (allocatable(c->prev)) {
-            c = c->prev;
-        }
-        if (has_available_address_space(c)) {
-            return c;
-        }
+            Block* c = *it;
+            // we found the lowest address of an unmapped segment
+            // but there might be a free segment we can also use
+            // right before it
+            if (allocatable(c->prev)) {
+                c = c->prev;
+            }
+            if (has_available_address_space(c)) {
+                return c;
+            }
         }
         auto segment_size = pool->is_small ? kSmallBuffer : kLargeBuffer;
         expandable_segments_.emplace_back(new ExpandableSegment(

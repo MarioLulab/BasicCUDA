@@ -200,6 +200,7 @@ ifneq ($(TARGET_ARCH),$(HOST_ARCH))
     endif
 endif
 
+
 ifdef TARGET_OVERRIDE # cuda toolkit targets override
     NVCCFLAGS += -target-dir $(TARGET_OVERRIDE)
 endif
@@ -237,6 +238,8 @@ ALL_CCFLAGS += $(NVCCFLAGS)
 ALL_CCFLAGS += $(EXTRA_NVCCFLAGS)
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(CCFLAGS))
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(EXTRA_CCFLAGS))
+ALL_CCFLAGS += -std=c++17
+
 
 SAMPLE_ENABLED := 1
 
@@ -248,6 +251,8 @@ ALL_LDFLAGS += $(addprefix -Xlinker ,$(EXTRA_LDFLAGS))
 # Common includes and paths for CUDA
 INCLUDES  := -L./
 LIBRARIES :=
+LIBRARIES += -L/usr/local/cuda/lib64 \
+             -lcudart
 
 ################################################################################
 
