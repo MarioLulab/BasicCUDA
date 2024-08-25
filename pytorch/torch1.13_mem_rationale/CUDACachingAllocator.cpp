@@ -637,8 +637,7 @@ public:
         int device,
         cudaStream_t stream,
         BlockPool* pool,
-        size_t size,
-        const std::shared_ptr<GatheredContext>& ctx) {
+        size_t size) {
         Block* candidate = find_expandable_block(device, stream, pool, size);
         // Candidate is now a list free/unmapped blocks with at least size room:
         // unmapped -> null
@@ -646,7 +645,7 @@ public:
         // free -> unmapped -> *
 
         if (!candidate->mapped &&
-            !map_block(candidate, std::min(candidate->size, size), ctx)) {
+            !map_block(candidate, std::min(candidate->size, size))) {
         return nullptr;
         }
         TORCH_INTERNAL_ASSERT(candidate->mapped);
@@ -657,7 +656,7 @@ public:
         auto remaining = size - candidate->size;
         auto new_candidate = candidate->next;
         if (!map_block(
-                new_candidate, std::min(remaining, candidate->next->size), ctx)) {
+                new_candidate, std::min(remaining, candidate->next->size))) {
             return nullptr;
         }
         candidate = new_candidate;
@@ -916,7 +915,7 @@ public:
             // the expandable_segments_ structure yet
             !p.pool->owner_PrivatePool) {
                 p.block = try_allocate_expandable_block(
-                    p.device(), p.stream(), p.pool, p.size(), ctx);
+                    p.device(), p.stream(), p.pool, p.size());
                 if (p.block) {
                     p.err = cudaSuccess;
                 } else {
@@ -1142,14 +1141,14 @@ public:
         for_each_selected_stat_type(stat_types, [&](size_t stat_type) {
         update_stat(stats.reserved_bytes[stat_type], -unmapped.size);
         });
-        if (record_history) {
-        record_trace(
-            TraceEntry::SEGMENT_UNMAP,
-            int64_t(unmapped.ptr),
-            unmapped.size,
-            block->stream,
-            block->history ? block->history->h.context : nullptr);
-        }
+        // if (record_history) {
+        // record_trace(
+        //     TraceEntry::SEGMENT_UNMAP,
+        //     int64_t(unmapped.ptr),
+        //     unmapped.size,
+        //     block->stream,
+        //     block->history ? block->history->h.context : nullptr);
+        // }
     }
 
 
@@ -1280,7 +1279,7 @@ void testDeviceCachingAllocator()
     cout << endl;
 
     cout << "====================get_free_block fucntion test:==================" << endl;
-    BlockPool block_pool(BlockComparator, true);
+    BlockPool block_pool(true);
     vector<Block *> block_vec;
     cudaStream_t cuda_stream = cudaStreamDefault;
     DeviceStats stats;

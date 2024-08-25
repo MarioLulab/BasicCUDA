@@ -8,7 +8,7 @@
 #define THC_DEVICE_ALLOCATOR_INC
 
 #include <cuda_runtime_api.h>
-#define EXPANDABLE_SEGMENTS_SUPPORTED
+#ifdef EXPANDABLE_SEGMENTS_SUPPORTED
 #include <cuda.h>
 #endif
 
@@ -35,6 +35,7 @@ using stream_set = set<cudaStream_t>;
 #if defined(__GNUC__) || defined(__ICL) || defined(__clang__)
 #define C10_LIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 1))
 #define C10_UNLIKELY(expr) (__builtin_expect(static_cast<bool>(expr), 0))
+#define C10_UNUSED __attribute__((__unused__))
 #else
 #define C10_LIKELY(expr) (expr)
 #define C10_UNLIKELY(expr) (expr)
