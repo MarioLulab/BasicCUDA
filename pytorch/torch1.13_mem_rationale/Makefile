@@ -238,7 +238,7 @@ ALL_CCFLAGS += $(NVCCFLAGS)
 ALL_CCFLAGS += $(EXTRA_NVCCFLAGS)
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(CCFLAGS))
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(EXTRA_CCFLAGS))
-ALL_CCFLAGS += -std=c++17
+ALL_CCFLAGS += -std=c++17 -g
 
 
 SAMPLE_ENABLED := 1
