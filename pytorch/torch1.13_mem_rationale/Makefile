@@ -252,7 +252,8 @@ ALL_LDFLAGS += $(addprefix -Xlinker ,$(EXTRA_LDFLAGS))
 INCLUDES  := -L./
 LIBRARIES :=
 LIBRARIES += -L/usr/local/cuda/lib64 \
-             -lcudart
+             -lcudart   \
+             -lcuda
 
 ################################################################################
 

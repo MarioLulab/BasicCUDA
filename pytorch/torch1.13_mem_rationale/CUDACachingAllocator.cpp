@@ -166,8 +166,10 @@ public:
                     TORCH_CHECK(val2 < 1.0, "garbage_collect_threshold too big, set it 0.0~1.0", "");
                     m_garbage_collection_threshold = val2;
                 } 
-                else if (kv[0].compare("expandable_segments") == 0) {                    
+                else if (kv[0].compare("expandable_segments") == 0) {
                     m_expandable_segments = (kv[1] == "True");
+                    std::cout <<  "expandable_segments = " << kv[1] << std::endl;   
+                    std::cout <<  "m_expandable_segments = " << m_expandable_segments << std::endl;   
                 }
                 else {
                     TORCH_CHECK(false, "Unrecognized CachingAllocator option: ", kv[0]);
@@ -1226,8 +1228,18 @@ void auxPrintPtrInfo(void *ptr)
 void auxPrintPoolBlocksInfo(DeviceCachingAllocator &allocator, string str)
 {
     cout << str << " Print allocator pools info:" << endl
-         << "  1> The block in large_blocks, number: " << allocator.large_blocks.blocks.size() << endl;
+         << "  0> The expandable segment in expandable_segments_, number: " << allocator.expandable_segments_.size() << endl;
     int idx = 0;
+    for (const auto &expandable_segment : allocator.expandable_segments_) {
+        printf("   Ptr%d: 0x%x, virtual addr: 0x%x, segment size: %s, size: %s, size of handles %d\n", idx++, expandable_segment, expandable_segment->ptr(),
+               format_size(expandable_segment->segment_size_).c_str(), format_size(expandable_segment->size()).c_str(),
+               expandable_segment->handles_.size());
+    }
+
+
+    cout << str << " Print allocator pools info:" << endl
+         << "  1> The block in large_blocks, number: " << allocator.large_blocks.blocks.size() << endl;
+    idx = 0;
     for (const auto &block : allocator.large_blocks.blocks) {
         printf("   Ptr%d: 0x%x, data ptr: 0x%x, data size: %s, is_split: %d\n", idx++, block, block->ptr,
                format_size(block->size).c_str(), block->is_split());
@@ -1244,6 +1256,7 @@ void auxPrintPoolBlocksInfo(DeviceCachingAllocator &allocator, string str)
         printf("   Ptr%d: 0x%x, data ptr: 0x%x, data size: %s, is_split: %d\n", idx++, block, block->ptr,
                format_size(block->size).c_str(), block->is_split());
     }
+    printf("\n");
 }
 
 void testDeviceCachingAllocator()

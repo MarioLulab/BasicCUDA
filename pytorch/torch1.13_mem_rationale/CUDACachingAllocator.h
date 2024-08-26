@@ -8,7 +8,7 @@
 #define THC_DEVICE_ALLOCATOR_INC
 
 #include <cuda_runtime_api.h>
-// #define EXPANDABLE_SEGMENTS_SUPPORTED 1
+#define EXPANDABLE_SEGMENTS_SUPPORTED 1
 #ifdef EXPANDABLE_SEGMENTS_SUPPORTED
 #include <cuda.h>
 #endif
@@ -416,7 +416,6 @@ struct ExpandableSegment {
         ptr_, segment_size_ * max_handles_));
   }
 
- private:
   void setAccess(int device, size_t begin, size_t end) {
     CUmemAccessDesc desc;
     desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
